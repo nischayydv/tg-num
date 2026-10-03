@@ -11,7 +11,6 @@ from fastapi import FastAPI, HTTPException, Query, Response
 from pydantic import BaseModel
 
 # ── Datasets ────────────────────────────────────────────────────────────────
-# Each entry: key -> (parquet_url, columns, primary_search_columns)
 DATASETS = {
     "tg": {
         "label": "TG Dataset",
@@ -20,14 +19,16 @@ DATASETS = {
             "https://huggingface.co/datasets/Nischayydv/tg-dataset/resolve/main/merged_all.parquet",
         ),
         "columns": ["user_id", "phone_number", "username", "country", "country_code"],
+        "phone_col": "phone_number",
     },
     "telegram": {
         "label": "Telegram Dataset",
         "url": os.environ.get(
             "TELEGRAM_PARQUET_URL",
-            "https://huggingface.co/datasets/sauravsingh2111/Telegram/resolve/main/TELEGRAM_MASTER_DB.parquet",
+            "hf://datasets/sauravsingh2111/Telegram/Telegram_10Digit_Chunk_part1.parquet",
         ),
         "columns": ["user_id", "phone", "username", "first_name", "last_name", "email"],
+        "phone_col": "phone",
     },
 }
 
@@ -44,12 +45,14 @@ pool = ThreadPoolExecutor(max_workers=PARALLELISM, thread_name_prefix="duck")
 
 def _new_conn() -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
+    # Vercel only allows writes to /tmp
     con.execute("SET home_directory='/tmp'")
     con.execute("SET extension_directory='/tmp/duckdb_extensions'")
     con.execute("INSTALL httpfs; LOAD httpfs;")
     con.execute("INSTALL parquet; LOAD parquet;")
     con.execute(f"SET threads = {THREADS_PER_CONN}")
 
+    # Optional HF token for private/gated datasets
     token = os.environ.get("HF_TOKEN")
     if token:
         con.execute(
@@ -57,12 +60,20 @@ def _new_conn() -> duckdb.DuckDBPyConnection:
             f"(TYPE huggingface, TOKEN '{token}')"
         )
 
-    # One view per dataset: people_tg, people_telegram
+    # One view per dataset
     for key, cfg in DATASETS.items():
-        con.execute(
-            f"CREATE OR REPLACE VIEW people_{key} AS "
-            f"SELECT * FROM read_parquet('{cfg['url']}')"
-        )
+        url = cfg["url"]
+        # Use hf:// protocol if available, else direct URL
+        if url.startswith("hf://"):
+            con.execute(
+                f"CREATE OR REPLACE VIEW people_{key} AS "
+                f"SELECT * FROM read_parquet('{url}')"
+            )
+        else:
+            con.execute(
+                f"CREATE OR REPLACE VIEW people_{key} AS "
+                f"SELECT * FROM read_parquet('{url}')"
+            )
     return con
 
 
@@ -105,6 +116,7 @@ def lookup_by_user_id(dataset: str, user_id: str, limit: int = 20) -> dict:
     ds = _resolve_dataset(dataset)
     uid = _escape(str(user_id).strip())
     cols = DATASETS[ds]["columns"]
+    phone_col = DATASETS[ds]["phone_col"]
     sql = (
         f"SELECT {', '.join(cols)} FROM people_{ds} "
         f"WHERE CAST(user_id AS VARCHAR) = '{uid}' LIMIT {limit}"
@@ -112,8 +124,6 @@ def lookup_by_user_id(dataset: str, user_id: str, limit: int = 20) -> dict:
     con = _get_conn()
     rows = _rows_to_dicts(con, con.execute(sql).fetchall())
 
-    # Phone column name differs per dataset
-    phone_col = "phone" if ds == "telegram" else "phone_number"
     phones, seen = [], set()
     for r in rows:
         p = r.get(phone_col)
@@ -192,6 +202,7 @@ def root():
             "unified_search": "/search?q=...&dataset=telegram",
             "field_search": "/search?q=...&field=phone&mode=exact&dataset=telegram",
             "batch_lookup": "POST /users/batch",
+            "debug": "/debug",
         },
         "docs": "/docs",
         "ui": "/ui",
@@ -208,6 +219,27 @@ def health():
             out[key] = {"status": "ok", "rows": n}
         except Exception as e:
             out[key] = {"status": "error", "detail": str(e)}
+    return out
+
+
+@app.get("/debug")
+def debug():
+    import traceback
+    out = {}
+    try:
+        con = _new_conn()
+        out["duckdb"] = "connected"
+    except Exception as e:
+        out["duckdb_error"] = str(e)
+        out["traceback"] = traceback.format_exc()
+        return out
+
+    for key, cfg in DATASETS.items():
+        try:
+            n = con.execute(f"SELECT COUNT(*) FROM people_{key}").fetchone()[0]
+            out[key] = {"ok": True, "rows": n, "url": cfg["url"]}
+        except Exception as e:
+            out[key] = {"ok": False, "error": str(e), "url": cfg["url"]}
     return out
 
 
