@@ -18,24 +18,30 @@ DATASETS = {
             "TG_PARQUET_URL",
             "https://huggingface.co/datasets/Nischayydv/tg-dataset/resolve/main/merged_all.parquet",
         ),
-        "columns": ["user_id", "phone_number", "username", "country", "country_code"],
-        "phone_col": "phone_number",
+        "type": "parquet",
     },
     "telegram": {
         "label": "Telegram Dataset",
         "url": os.environ.get(
             "TELEGRAM_PARQUET_URL",
-            "hf://datasets/sauravsingh2111/Telegram/Telegram_10Digit_Chunk_part1.parquet",
+            "https://huggingface.co/datasets/sauravsingh2111/Telegram/resolve/main/Telegram_10Digit_Chunk_part1.parquet",
         ),
-        "columns": ["user_id", "phone", "username", "first_name", "last_name", "email"],
-        "phone_col": "phone",
+        "type": "parquet",
+    },
+    "darkweb": {
+        "label": "DarkWeb TG Dataset",
+        "url": os.environ.get(
+            "DARKWEB_CSV_URL",
+            "https://huggingface.co/datasets/devilkingpc/darkwebtg/resolve/main/id-phone.csv",
+        ),
+        "type": "csv",
     },
 }
 
-# Unified column set across both datasets
+# Unified column set across all datasets
 UNIFIED_COLUMNS = [
     "user_id", "phone_number", "phone", "username",
-    "country", "country_code", "first_name", "last_name", "email",
+    "country", "country_code", "first_name", "last_name", "email", "source",
 ]
 
 PARALLELISM      = int(os.environ.get("TG_PARALLEL", "2"))
@@ -50,12 +56,14 @@ pool = ThreadPoolExecutor(max_workers=PARALLELISM, thread_name_prefix="duck")
 
 def _new_conn() -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
+    # Vercel only allows writes to /tmp
     con.execute("SET home_directory='/tmp'")
     con.execute("SET extension_directory='/tmp/duckdb_extensions'")
     con.execute("INSTALL httpfs; LOAD httpfs;")
     con.execute("INSTALL parquet; LOAD parquet;")
     con.execute(f"SET threads = {THREADS_PER_CONN}")
 
+    # Optional HF token for private/gated datasets
     token = os.environ.get("HF_TOKEN")
     if token:
         con.execute(
@@ -63,20 +71,52 @@ def _new_conn() -> duckdb.DuckDBPyConnection:
             f"(TYPE huggingface, TOKEN '{token}')"
         )
 
-    # ── Per-dataset views ───────────────────────────────────────────────
-    for key, cfg in DATASETS.items():
-        con.execute(
-            f"CREATE OR REPLACE VIEW people_{key} AS "
-            f"SELECT * FROM read_parquet('{cfg['url']}')"
-        )
-
-    # ── Unified view: both datasets merged by column name ───────────────
-    # union_by_name = true fills missing columns with NULL so that
-    # phone_number (tg) and phone (telegram) both survive.
-    urls = [f"'{cfg['url']}'" for cfg in DATASETS.values()]
+    # ── Normalized views ─────────────────────────────────────────────────
+    # 1. TG Dataset (Parquet)
     con.execute(
-        f"CREATE OR REPLACE VIEW people_all AS "
-        f"SELECT * FROM read_parquet([{', '.join(urls)}], union_by_name = true)"
+        f"CREATE OR REPLACE VIEW people_tg AS "
+        f"SELECT user_id, phone_number, username, country, country_code, "
+        f"       NULL AS phone, NULL AS first_name, NULL AS last_name, NULL AS email, "
+        f"       'tg' AS source "
+        f"FROM read_parquet('{DATASETS['tg']['url']}')"
+    )
+
+    # 2. Telegram Dataset (Parquet)
+    con.execute(
+        f"CREATE OR REPLACE VIEW people_telegram AS "
+        f"SELECT user_id, NULL AS phone_number, username, NULL AS country, NULL AS country_code, "
+        f"       phone, first_name, last_name, email, "
+        f"       'telegram' AS source "
+        f"FROM read_parquet('{DATASETS['telegram']['url']}')"
+    )
+
+    # 3. DarkWeb Dataset (CSV)
+    #    The CSV has a single column with tab-separated values like "100000002\t989137088279".
+    #    We use read_csv with header=false, then split_part to extract user_id and phone.
+    con.execute(
+        f"CREATE OR REPLACE VIEW people_darkweb AS "
+        f"SELECT "
+        f"  split_part(column0, '\t', 1) AS user_id, "
+        f"  NULL AS phone_number, "
+        f"  NULL AS username, "
+        f"  NULL AS country, "
+        f"  NULL AS country_code, "
+        f"  split_part(column0, '\t', 2) AS phone, "
+        f"  NULL AS first_name, "
+        f"  NULL AS last_name, "
+        f"  NULL AS email, "
+        f"  'darkweb' AS source "
+        f"FROM read_csv('{DATASETS['darkweb']['url']}', header=false, columns={{'column0': 'VARCHAR'}})"
+    )
+
+    # ── Unified view: all datasets merged ─────────────────────────────────
+    con.execute(
+        "CREATE OR REPLACE VIEW people_all AS "
+        "SELECT * FROM people_tg "
+        "UNION ALL "
+        "SELECT * FROM people_telegram "
+        "UNION ALL "
+        "SELECT * FROM people_darkweb"
     )
     return con
 
@@ -119,10 +159,8 @@ def _resolve_dataset(name: str) -> str:
 def lookup_by_user_id(dataset: str, user_id: str, limit: int = 20) -> dict:
     ds = _resolve_dataset(dataset)
     uid = _escape(str(user_id).strip())
-    cols = DATASETS[ds]["columns"]
-    phone_col = DATASETS[ds]["phone_col"]
     sql = (
-        f"SELECT {', '.join(cols)} FROM people_{ds} "
+        f"SELECT * FROM people_{ds} "
         f"WHERE CAST(user_id AS VARCHAR) = '{uid}' LIMIT {limit}"
     )
     con = _get_conn()
@@ -130,7 +168,7 @@ def lookup_by_user_id(dataset: str, user_id: str, limit: int = 20) -> dict:
 
     phones, seen = [], set()
     for r in rows:
-        p = r.get(phone_col)
+        p = r.get("phone_number") or r.get("phone")
         if p and p not in seen:
             seen.add(p)
             phones.append(p)
@@ -144,7 +182,7 @@ def lookup_by_user_id(dataset: str, user_id: str, limit: int = 20) -> dict:
     }
 
 
-# ── ⭐ SEARCH BOTH DATASETS SIMULTANEOUSLY ──────────────────────────────────
+# ── ⭐ SEARCH ALL THREE DATASETS SIMULTANEOUSLY ────────────────────────────
 def search_all(
     user_id: str = "",
     username: str = "",
@@ -152,7 +190,7 @@ def search_all(
     limit: int = 50,
 ) -> dict:
     """
-    Search across BOTH datasets at once.
+    Search across ALL THREE datasets at once.
     Provide at least one of: user_id, username, or phone.
     """
     conditions = []
@@ -164,7 +202,7 @@ def search_all(
         conditions.append(f"username ILIKE '%{v}%'")
     if phone and phone.strip():
         v = _escape(phone.strip())
-        # phone_number is from tg dataset; phone is from telegram dataset
+        # phone_number is from tg dataset; phone is from telegram & darkweb datasets
         conditions.append(
             f"(CAST(phone_number AS VARCHAR) = '{v}' "
             f"OR CAST(phone AS VARCHAR) = '{v}')"
@@ -178,14 +216,6 @@ def search_all(
 
     con = _get_conn()
     rows = _rows_to_dicts(con, con.execute(sql).fetchall())
-
-    # Add a `source` label so you know which dataset each row came from
-    for r in rows:
-        if r.get("phone_number") and r.get("country"):
-            r["source"] = "tg"
-        else:
-            r["source"] = "telegram"
-
     return {
         "query": {"user_id": user_id, "username": username, "phone": phone},
         "count": len(rows),
@@ -193,14 +223,13 @@ def search_all(
     }
 
 
-# ── Unified search across all string columns (both datasets) ────────────────
+# ── Free-text search across all datasets ────────────────────────────────────
 def search_both_datasets(q: str, limit: int = 20) -> dict:
     q = q.strip()
     if not q:
         return {"query": q, "count": 0, "results": []}
     v = _escape(q)
 
-    # Search across every column present in the unified view
     where = " OR ".join(
         f"CAST({c} AS VARCHAR) ILIKE '%{v}%'" for c in UNIFIED_COLUMNS
     )
@@ -208,25 +237,19 @@ def search_both_datasets(q: str, limit: int = 20) -> dict:
 
     con = _get_conn()
     rows = _rows_to_dicts(con, con.execute(sql).fetchall())
-
-    for r in rows:
-        if r.get("phone_number") and r.get("country"):
-            r["source"] = "tg"
-        else:
-            r["source"] = "telegram"
-
     return {"query": q, "count": len(rows), "results": rows}
 
 
-# ── Per-dataset helpers (kept for compatibility) ────────────────────────────
+# ── Per-dataset helpers ─────────────────────────────────────────────────────
 def _unified_search(dataset: str, q: str, limit: int = 10) -> dict:
     ds = _resolve_dataset(dataset)
     q = q.strip()
     if not q:
         return {"dataset": ds, "query": q, "count": 0, "results": []}
-    cols = DATASETS[ds]["columns"]
     v = _escape(q)
-    where = " OR ".join(f"CAST({c} AS VARCHAR) ILIKE '%{v}%'" for c in cols)
+    where = " OR ".join(
+        f"CAST({c} AS VARCHAR) ILIKE '%{v}%'" for c in UNIFIED_COLUMNS
+    )
     sql = f"SELECT * FROM people_{ds} WHERE {where} LIMIT {limit}"
     con = _get_conn()
     rows = _rows_to_dicts(con, con.execute(sql).fetchall())
@@ -235,8 +258,8 @@ def _unified_search(dataset: str, q: str, limit: int = 10) -> dict:
 
 def _run_field_search(dataset: str, field: str, value: str, mode: str, limit: int) -> dict:
     ds = _resolve_dataset(dataset)
-    if field not in DATASETS[ds]["columns"]:
-        raise ValueError(f"Unknown field '{field}' for dataset '{ds}'")
+    if field not in UNIFIED_COLUMNS:
+        raise ValueError(f"Unknown field '{field}'")
     v = _escape(value)
     if mode == "exact":
         sql = f"SELECT * FROM people_{ds} WHERE CAST({field} AS VARCHAR) = '{v}' LIMIT {limit}"
@@ -253,7 +276,7 @@ def _run_field_search(dataset: str, field: str, value: str, mode: str, limit: in
 
 
 # ── FastAPI ─────────────────────────────────────────────────────────────────
-app = FastAPI(title="Unified TG + Telegram Search API")
+app = FastAPI(title="Unified TG + Telegram + DarkWeb Search API")
 
 
 class BatchUserIDRequest(BaseModel):
@@ -265,17 +288,15 @@ class BatchUserIDRequest(BaseModel):
 @app.get("/")
 def root():
     return {
-        "app": "Unified TG + Telegram Search API",
+        "app": "Unified TG + Telegram + DarkWeb Search API",
         "datasets": {
-            k: {"label": v["label"], "columns": v["columns"]}
-            for k, v in DATASETS.items()
+            k: {"label": v["label"]} for k, v in DATASETS.items()
         },
         "endpoints": {
             "search_all": "/search/all?user_id=...&username=...&phone=...",
             "search_both": "/search/both?q=...",
             "lookup_user_id": "/user/{user_id}?dataset=telegram",
             "unified_search": "/search?q=...&dataset=telegram",
-            "bots_search": "/bots?q=razvitie&dataset=telegram",
             "batch_lookup": "POST /users/batch",
             "debug": "/debug",
         },
@@ -287,19 +308,13 @@ def root():
 @app.get("/health")
 def health():
     out = {}
-    for key in DATASETS:
+    for key in list(DATASETS) + ["all"]:
         try:
             con = _get_conn()
             n = con.execute(f"SELECT COUNT(*) FROM people_{key}").fetchone()[0]
             out[key] = {"status": "ok", "rows": n}
         except Exception as e:
             out[key] = {"status": "error", "detail": str(e)}
-    try:
-        con = _get_conn()
-        n = con.execute("SELECT COUNT(*) FROM people_all").fetchone()[0]
-        out["all"] = {"status": "ok", "rows": n}
-    except Exception as e:
-        out["all"] = {"status": "error", "detail": str(e)}
     return out
 
 
@@ -325,24 +340,15 @@ def debug():
     return out
 
 
-# ⭐ Search BOTH datasets at once
+# ⭐ Search ALL datasets at once
 @app.get("/search/all")
 async def search_all_endpoint(
     user_id: str = Query("", description="Exact user_id match"),
     username: str = Query("", description="Partial username match (contains)"),
-    phone: str = Query("", description="Exact phone match (both datasets)"),
+    phone: str = Query("", description="Exact phone match (all datasets)"),
     limit: int = Query(50, ge=1, le=500),
     pretty: bool = Query(True),
 ):
-    """
-    Search across BOTH datasets simultaneously.
-
-    Examples:
-      /search/all?user_id=1686533205
-      /search/all?username=faceless
-      /search/all?phone=5111381608
-      /search/all?username=faceless&phone=5111381608
-    """
     loop = asyncio.get_running_loop()
     data = await loop.run_in_executor(
         pool, search_all, user_id, username, phone, limit
@@ -352,22 +358,13 @@ async def search_all_endpoint(
     return Response(content=content, media_type="application/json")
 
 
-# ⭐ Free-text search across both datasets
+# ⭐ Free-text search across all datasets
 @app.get("/search/both")
 async def search_both_endpoint(
-    q: str = Query(..., description="Free-text search across all columns in both datasets"),
+    q: str = Query(..., description="Free-text search across all columns in all datasets"),
     limit: int = Query(20, ge=1, le=200),
     pretty: bool = Query(True),
 ):
-    """
-    Free-text search across BOTH datasets.
-    Matches any column (user_id, phone, username, names, etc.).
-
-    Examples:
-      /search/both?q=faceless_14
-      /search/both?q=Razvitiekanala_bot
-      /search/both?q=5111381608
-    """
     if not q.strip():
         raise HTTPException(422, "Provide q")
     loop = asyncio.get_running_loop()
@@ -377,7 +374,7 @@ async def search_both_endpoint(
     return Response(content=content, media_type="application/json")
 
 
-# Per-dataset endpoints (still work)
+# Per-dataset endpoints
 @app.get("/user/{user_id}")
 async def user_lookup(
     user_id: str,
@@ -437,15 +434,12 @@ async def users_batch(req: BatchUserIDRequest):
 
 
 # ── Gradio UI ───────────────────────────────────────────────────────────────
-def format_row(r: dict, columns: list) -> str:
+def format_row(r: dict) -> str:
     lines = []
-    for k in columns:
+    for k in UNIFIED_COLUMNS:
         v = r.get(k)
         if v:
             lines.append(f"**{k}:** {v}")
-    src = r.get("source")
-    if src:
-        lines.append(f"**source:** `{src}`")
     return "\n\n".join(lines)
 
 
@@ -458,12 +452,12 @@ def search_all_ui(user_id: str, username: str, phone: str, limit: int) -> str:
         return f"❌ Error: {str(e)}"
 
     if not data["count"]:
-        return "❌ **No results found across both datasets.**"
+        return "❌ **No results found across any dataset.**"
 
-    lines = [f"🔍 **Searching BOTH datasets**  |  **Found:** {data['count']}", "", "---", ""]
+    lines = [f"🔍 **Searching ALL datasets**  |  **Found:** {data['count']}", "", "---", ""]
     for i, r in enumerate(data["results"], 1):
         lines.append(f"### Result {i}")
-        lines.append(format_row(r, UNIFIED_COLUMNS))
+        lines.append(format_row(r))
         lines.append("")
     return "\n\n".join(lines)
 
@@ -477,12 +471,12 @@ def search_both_ui(q: str, limit: int) -> str:
         return f"❌ Error: {str(e)}"
 
     if not data["count"]:
-        return f"🔍 **Query:** `{q}`\n\n❌ **No results found across both datasets.**"
+        return f"🔍 **Query:** `{q}`\n\n❌ **No results found across any dataset.**"
 
     lines = [f"🔍 **Query:** `{q}`  |  **Found:** {data['count']}", "", "---", ""]
     for i, r in enumerate(data["results"], 1):
         lines.append(f"### Result {i}")
-        lines.append(format_row(r, UNIFIED_COLUMNS))
+        lines.append(format_row(r))
         lines.append("")
     return "\n\n".join(lines)
 
@@ -508,37 +502,37 @@ def lookup_ui(dataset: str, user_id: str, limit: int) -> str:
     ]
     for i, r in enumerate(data["results"], 1):
         lines.append(f"### Result {i}")
-        lines.append(format_row(r, DATASETS[data["dataset"]]["columns"]))
+        lines.append(format_row(r))
         lines.append("")
     return "\n\n".join(lines)
 
 
 def build_ui() -> gr.Blocks:
-    with gr.Blocks(title="Unified TG + Telegram Search", theme=gr.themes.Soft()) as demo:
-        gr.Markdown("# 🔍 Unified TG + Telegram Search")
-        gr.Markdown("Search across **both datasets simultaneously** using DuckDB's `union_by_name`.")
+    with gr.Blocks(title="Unified TG + Telegram + DarkWeb Search", theme=gr.themes.Soft()) as demo:
+        gr.Markdown("# 🔍 Unified TG + Telegram + DarkWeb Search")
+        gr.Markdown("Search across **all datasets simultaneously**.")
 
-        with gr.Tab("🔎 Search Both"):
+        with gr.Tab("🔎 Search All"):
             with gr.Row():
                 uid_in = gr.Textbox(label="User ID (exact)", placeholder="e.g. 1686533205")
                 uname_in = gr.Textbox(label="Username (contains)", placeholder="e.g. faceless")
                 phone_in = gr.Textbox(label="Phone (exact)", placeholder="e.g. 5111381608")
                 limit_all = gr.Slider(minimum=1, maximum=200, value=50, step=1, label="Max Results")
-            btn_all = gr.Button("🔍 Search Both Datasets", variant="primary", size="lg")
+            btn_all = gr.Button("🔍 Search All Datasets", variant="primary", size="lg")
             out_all = gr.Markdown(label="Results")
             btn_all.click(fn=search_all_ui, inputs=[uid_in, uname_in, phone_in, limit_all], outputs=out_all)
 
         with gr.Tab("💬 Free-text Search"):
             with gr.Row():
-                q_in = gr.Textbox(label="Search Query", placeholder="e.g. Razvitiekanala_bot")
+                q_in = gr.Textbox(label="Search Query", placeholder="e.g. 989137088279")
                 limit_both = gr.Slider(minimum=1, maximum=200, value=20, step=1, label="Max Results")
-            btn_both = gr.Button("🔍 Search Both", variant="primary", size="lg")
+            btn_both = gr.Button("🔍 Search All", variant="primary", size="lg")
             out_both = gr.Markdown(label="Results")
             btn_both.click(fn=search_both_ui, inputs=[q_in, limit_both], outputs=out_both)
 
         with gr.Tab("🆔 Single Dataset"):
             with gr.Row():
-                ds_dd = gr.Dropdown(choices=["telegram", "tg"], value="telegram", label="Dataset")
+                ds_dd = gr.Dropdown(choices=["tg", "telegram", "darkweb"], value="telegram", label="Dataset")
                 uid2 = gr.Textbox(label="User ID", placeholder="e.g. 1686533205")
                 limit_ds = gr.Slider(minimum=1, maximum=100, value=20, step=1, label="Max Results")
             btn_ds = gr.Button("🔍 Lookup", variant="primary")
